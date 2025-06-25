@@ -29,19 +29,19 @@ class EmailService {
     }
     
     this.templates = new Map();
-    this.loadTemplates();
+    this.loadTemplatesSync();
   }
 
-  async loadTemplates() {
+  loadTemplatesSync() {
     try {
       const templatesDir = path.join(__dirname, '../templates/emails');
-      const templateFiles = await fs.readdir(templatesDir);
-      
+      const templateFiles = fs.readdirSync(templatesDir);
+
       for (const file of templateFiles) {
         if (file.endsWith('.hbs')) {
           const templateName = file.replace('.hbs', '');
-          const templateContent = await fs.readFile(
-            path.join(templatesDir, file), 
+          const templateContent = fs.readFileSync(
+            path.join(templatesDir, file),
             'utf-8'
           );
           this.templates.set(templateName, handlebars.compile(templateContent));
