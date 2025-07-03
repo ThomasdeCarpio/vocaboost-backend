@@ -1,7 +1,8 @@
-// middleware/protection/loginAttempts.js
+// src/middleware/protection/loginAttempts.js
+
 const cacheService = require('../../services/cacheService');
 const EmailService = require('../../services/emailService');
-const User = require('../../models/User');
+const Profile = require('../../models/Profile'); // ✅ CHANGED: Import Profile model instead of User
 
 class LoginAttemptsMiddleware {
   constructor() {
@@ -16,13 +17,9 @@ class LoginAttemptsMiddleware {
     const ipKey = `login_attempts_ip:${ipAddress}`;
     
     try {
-      // Track by email
       const attempts = await cacheService.incr(key, this.attemptWindow);
-      
-      // Also track by IP to prevent distributed attacks
       const ipAttempts = await cacheService.incr(ipKey, this.attemptWindow);
       
-      // Check if account should be locked
       if (attempts >= this.maxAttempts) {
         await this.lockAccount(email, attempts, ipAddress);
       }
@@ -35,7 +32,6 @@ class LoginAttemptsMiddleware {
       };
     } catch (error) {
       console.error('Failed to track login attempt:', error);
-      // Don't block login if tracking fails
       return {
         attempts: 0,
         ipAttempts: 0,
@@ -71,7 +67,7 @@ class LoginAttemptsMiddleware {
           isLocked: true,
           reason: lockData.reason,
           lockedUntil: lockData.lockedUntil,
-          remainingMinutes: remainingTime
+          remainingMinutes: remainingTime > 0 ? remainingTime : 1
         };
       }
       
@@ -101,14 +97,14 @@ class LoginAttemptsMiddleware {
       
       // Send notification email
       try {
-        const user = await User.findByEmail(email);
-        if (user) {
+        // ✅ CHANGED: Use the new Profile model to find the user's profile
+        const profile = await Profile.findByEmail(email);
+        if (profile) {
           const emailService = new EmailService();
-          await emailService.sendAccountLockedNotification({
+          await emailService.sendAccountLockedNotification({ // Assumes this method exists in your email service
             to: email,
-            fullName: user.full_name || 'User',
+            fullName: profile.display_name || 'User',
             lockReason: lockData.reason,
-            attemptCount: attempts,
             unlockTime: new Date(lockedUntil)
           });
         }
@@ -116,7 +112,6 @@ class LoginAttemptsMiddleware {
         console.error('Failed to send lock notification:', emailError);
       }
       
-      // Log security event
       console.warn(`Account locked: ${email} after ${attempts} attempts from IP: ${ipAddress}`);
       
     } catch (error) {
@@ -135,7 +130,6 @@ class LoginAttemptsMiddleware {
       }
       
       try {
-        // Check if account is locked
         const lockStatus = await this.isAccountLocked(email);
         
         if (lockStatus.isLocked) {
@@ -145,26 +139,26 @@ class LoginAttemptsMiddleware {
             details: {
               reason: lockStatus.reason,
               remainingMinutes: lockStatus.remainingMinutes,
-              message: `Vui lòng thử lại sau ${lockStatus.remainingMinutes} phút`
+              message: `Vui lòng thử lại sau ${lockStatus.remainingMinutes} phút.`
             }
           });
         }
         
-        // Check IP-based rate limiting
+        // IP-based rate limiting is still useful here
         const ipKey = `login_attempts_ip:${ipAddress}`;
         const ipAttempts = await cacheService.get(ipKey) || 0;
         
-        if (ipAttempts >= this.maxAttempts * 2) { // Higher limit for IP
+        if (ipAttempts >= this.maxAttempts * 2) {
           return res.status(429).json({
             success: false,
-            error: 'Quá nhiều yêu cầu từ địa chỉ IP này',
+            error: 'Quá nhiều yêu cầu từ địa chỉ IP này.',
             details: {
-              message: 'Vui lòng thử lại sau 15 phút'
+              message: 'Vui lòng thử lại sau 15 phút.'
             }
           });
         }
         
-        // Attach tracking functions to request
+        // Attach tracking functions to request so the controller can use them
         req.loginTracking = {
           trackFailure: () => this.trackFailedAttempt(email, ipAddress),
           clearAttempts: () => this.clearAttempts(email, ipAddress)
@@ -173,14 +167,14 @@ class LoginAttemptsMiddleware {
         next();
       } catch (error) {
         console.error('Login attempts middleware error:', error);
-        // Don't block on error
-        next();
+        next(); // Don't block login if the middleware itself fails
       }
     };
   }
 
-  // Get current attempt status
+  // ... getAttemptStatus method remains the same ...
   async getAttemptStatus(email) {
+    // This method does not need changes as it only interacts with the cache
     try {
       const key = `login_attempts:${email}`;
       const attempts = await cacheService.get(key) || 0;

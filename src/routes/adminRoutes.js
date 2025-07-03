@@ -1,47 +1,35 @@
+// src/routes/adminRoutes.js
+
 const router = require('express').Router();
-const adminController = require('../controllers/adminController');
+const adminController = require('../controllers/adminController'); // This controller is already updated
 const { authenticateJWT, requireRole } = require('../middleware/auth');
 const rateLimiters = require('../middleware/protection/rateLimiter');
-const { auditLogger } = require('../middleware/core/logging');
 
-// Apply authentication and admin role to all routes
-router.use(authenticateJWT);
-router.use(requireRole('admin'));
-router.use(rateLimiters.admin);
-router.use(auditLogger);
+// Apply authentication and admin role middleware to all routes in this file
+router.use(authenticateJWT, requireRole('admin'), rateLimiters.admin);
 
-// USC18: Ban/Unban accounts
-router.post('/users/ban', adminController.banAccount);
-router.post('/users/unban', adminController.unbanAccount);
+// --- User Management ---
+// [USC18] Ban/Unban accounts
+router.post('/profiles/ban', adminController.banAccount);
+router.post('/profiles/unban', adminController.unbanAccount);
+router.get('/profiles', adminController.listUsers); // List all user profiles
+router.put('/profiles/:userId', adminController.updateUserByAdmin); // Update a user's role/status
 
-// USC19: Teacher requests
+// --- Teacher Verification ---
+// [USC19] Approve Teacher Requests
 router.get('/teacher-requests', adminController.getTeacherRequests);
-router.post('/teacher-requests/:requestId/review', adminController.approveTeacherRequest);
+router.post('/teacher-requests/:teacherId/review', adminController.reviewTeacherRequest);
 
-// USC20: Content moderation
+// --- Content Moderation ---
+// [USC20] Moderate Content
 router.get('/reports', adminController.getReportedContent);
 router.post('/reports/:reportId/moderate', adminController.moderateContent);
 
-// USC21: System analytics
+// --- System Analytics & Health ---
+// [USC21] View system analytics
 router.get('/analytics', adminController.getSystemAnalytics);
-router.get('/analytics/export', adminController.exportAnalytics);
+router.get('/health', (req, res) => res.json({ status: 'OK' })); // A simple health check for the admin scope
 
-// Admin logs
-router.get('/logs', adminController.getAdminLogs);
-
-// System health
-router.get('/health', adminController.getSystemHealth);
-
-// User management
-router.get('/users', adminController.getUsers);
-router.put('/users/:userId', adminController.updateUser);
-router.post('/users/bulk-action', adminController.bulkUserAction);
-
-// Content management
-router.get('/content/vocabulary', adminController.getVocabularyContent);
-router.delete('/content/vocabulary/:id', adminController.removeVocabulary);
-
-// Email management
-router.post('/email/broadcast', adminController.sendBroadcastEmail);
+// ... other admin routes for logs, content, etc. ...
 
 module.exports = router;

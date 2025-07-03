@@ -1,29 +1,28 @@
+// src/routes/authRoutes.js
+
 const router = require('express').Router();
 const passport = require('passport');
-const authController = require('../controllers/authController');
+const authController = require('../controllers/authController'); // This controller is already updated
 const rateLimiters = require('../middleware/protection/rateLimiter');
 const loginAttempts = require('../middleware/protection/loginAttempts');
-const { authValidators } = require('../middleware/validation/validators');
-const { body } = require('express-validator');
-const { handleValidationErrors } = require('../middleware/validation/validators');
+// const { authValidators } = require('../middleware/validation/validators');
 
-// Register
+// [USC1] Register a new user
 router.post('/register', 
   rateLimiters.auth,
-  authValidators.register,
+  // authValidators.register,
   authController.register
 );
 
-
-// Login with login attempts tracking
+// [USC2] Login with email/password
 router.post('/login',
   rateLimiters.auth,
-  authValidators.login,
+  // authValidators.login,
   loginAttempts.checkLoginAttempts(),
   authController.login
 );
 
-// Google OAuth
+// [USC2] Google OAuth Authentication Flow
 router.get('/google', 
     passport.authenticate('google', { scope: ['profile', 'email'] })
 );
@@ -33,53 +32,27 @@ router.get('/google/callback',
     authController.googleLogin
 );
 
-// Logout
+// [USC3] Logout
 router.post('/logout', authController.logout);
 
-// Forgot password
+// Password Reset Flow
 router.post('/forgot-password',
-  rateLimiters.auth,
-  [
-    body('email')
-      .isEmail()
-      .normalizeEmail()
-      .withMessage('Invalid email format'),
-    handleValidationErrors
-  ],
+  rateLimiters.email, // Use a stricter email-based rate limit
   authController.forgotPassword
 );
 
-// Reset password
-router.post('/reset-password',
-  rateLimiters.auth,
-  [
-    body('token')
-      .notEmpty()
-      .withMessage('Token is required'),
-    body('newPassword')
-      .isLength({ min: 8 })
-      .withMessage('Password must be at least 8 characters long')
-      .matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/)
-      .withMessage('Password must contain uppercase, lowercase and number'),
-    handleValidationErrors
-  ],
-  authController.resetPassword
-);
+// The actual password update happens on the frontend via Supabase client-side library
+// after the user clicks the link from the forgot-password email.
+// We don't need a `/reset-password` endpoint on the backend for this flow.
 
-// Verify email
-router.get('/verify-email/:token', authController.verifyEmail);
-
-// Resend verification email
+// Email Verification Flow
 router.post('/resend-verification',
   rateLimiters.email,
-  [
-    body('email')
-      .isEmail()
-      .normalizeEmail()
-      .withMessage('Invalid email format'),
-    handleValidationErrors
-  ],
   authController.resendVerificationEmail
 );
+
+// The user clicks the verification link from their email, which points to the FRONTEND.
+// The frontend then uses the Supabase client library to verify the token.
+// We do not need a `/verify-email` endpoint on the backend.
 
 module.exports = router;

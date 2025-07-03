@@ -1,276 +1,186 @@
-const supabase = require('../config/database');
-const aiService = require('../services/aiService');
+// src/controllers/vocabularyController.js
+
+// Import the Models. The controller's job is to call these.
+const VocabularyList = require('../models/VocabularyList');
+const Word = require('../models/Word');
 
 class VocabularyController {
-    // Get all vocabulary lists - USC8: Choose vocabulary list
-    async getLists(req, res) {
+
+    // Handles POST /api/vocabulary/lists
+    // Creates a new vocabulary list.
+    async createList(req, res, next) {
         try {
-            const userId = req.user?.id;
-            const { search, tag, privacy } = req.query;
-            
-            let query = supabase
-                .from('vocabulary_lists')
-                .select(`
-                    *,
-                    creator:users!owner_id(display_name),
-                    words:vocabulary_items(count)
-                `);
-            
-            // Filter by privacy
-            if (privacy) {
-                query = query.eq('privacy', privacy);
-            } else {
-                // Default: show public lists and user's own lists
-                query = query.or(`privacy.eq.public${userId ? `,owner_id.eq.${userId}` : ''}`);
-            }
-            
-            // Search
-            if (search) {
-                query = query.ilike('name', `%${search}%`);
-            }
-            
-            // Filter by tag
-            if (tag) {
-                query = query.contains('tags', [tag]);
-            }
-            
-            const { data: lists, error } = await query;
-            
-            if (error) throw error;
-            
-            res.json({ lists });
-            
+            // 1. Extract data from the request body and the authenticated user.
+            const listData = {
+                ...req.body,
+                creator_id: req.user.id // This comes from your 'authenticateJWT' middleware.
+            };
+
+            // 2. Call the Model to do the database work.
+            const newList = await VocabularyList.create(listData);
+
+            // 3. Send the successful response.
+            res.status(201).json({ success: true, data: newList });
         } catch (error) {
-            console.error('Get lists error:', error);
-            res.status(500).json({ error: 'Failed to fetch lists' });
+            // 4. Pass any errors to the global error handler.
+            next(error);
         }
     }
-    
-    // Create vocabulary list - USC9: Create new vocabulary list
-    async createList(req, res) {
-        try {
-            const userId = req.user.id;
-            const { name, description, privacy = 'private', tags = [], words = [] } = req.body;
-            
-            // Create list
-            const { data: list, error: listError } = await supabase
-                .from('vocabulary_lists')
-                .insert({
-                    name,
-                    description,
-                    owner_id: userId,
-                    privacy,
-                    tags
-                })
-                .select()
-                .single();
-                
-            if (listError) throw listError;
-            
-            // Add words if provided
-            if (words.length > 0) {
-                const vocabularyItems = await Promise.all(words.map(async (word) => {
-                    // Generate AI example if not provided
-                    let exampleSentence = word.example_sentence;
-                    if (!exampleSentence && word.generate_example) {
-                        exampleSentence = await aiService.generateExample(word.word);
-                    }
-                    
-                    return {
-                        list_id: list.id,
-                        word: word.word,
-                        meaning: word.meaning,
-                        pronunciation: word.pronunciation,
-                        example_sentence: exampleSentence,
-                        image_url: word.image_url
-                    };
-                }));
-                
-                const { error: wordsError } = await supabase
-                    .from('vocabulary_items')
-                    .insert(vocabularyItems);
-                    
-                if (wordsError) throw wordsError;
-            }
-            
-            res.status(201).json({
-                message: 'Vocabulary list created successfully',
-                list
-            });
-            
-        } catch (error) {
-            console.error('Create list error:', error);
-            res.status(500).json({ error: 'Failed to create list' });
-        }
-    }
-    
-    // Get single vocabulary list - USC10: View vocabulary list
-    async getList(req, res) {
+
+    // Handles GET /api/vocabulary/lists/:id
+    // Fetches a single vocabulary list.
+    async getListById(req, res, next) {
         try {
             const { id } = req.params;
-            const userId = req.user?.id;
-            
-            // Get list with words
-            const { data: list, error } = await supabase
-                .from('vocabulary_lists')
-                .select(`
-                    *,
-                    creator:users!owner_id(display_name),
-                    words:vocabulary_items(*)
-                `)
-                .eq('id', id)
-                .single();
-                
-            if (error) throw error;
-            
-            // Check access permission
-            if (list.privacy === 'private' && list.owner_id !== userId) {
-                return res.status(403).json({ error: 'Access denied' });
+            const list = await VocabularyList.findById(id);
+
+            if (!list) {
+                return res.status(404).json({ success: false, error: 'List not found' });
             }
-            
-            // Get learning progress if user is authenticated
-            if (userId) {
-                const { data: progress } = await supabase
-                    .from('learning_progress')
-                    .select('*')
-                    .eq('user_id', userId)
-                    .in('word_id', list.words.map(w => w.id));
-                    
-                // Merge progress data
-                list.words = list.words.map(word => {
-                    const wordProgress = progress?.find(p => p.word_id === word.id);
-                    return {
-                        ...word,
-                        progress: wordProgress || null
-                    };
-                });
+
+            // --- IMPORTANT: Business Logic & Security Check ---
+            // A controller must enforce permissions.
+            if (list.privacy_setting === 'private' && list.creator_id !== req.user?.id) {
+                // The optionalAuth middleware allows req.user to be null.
+                return res.status(403).json({ success: false, error: 'You do not have permission to view this list' });
             }
-            
-            res.json({ list });
-            
+
+            res.json({ success: true, data: list });
         } catch (error) {
-            console.error('Get list error:', error);
-            res.status(500).json({ error: 'Failed to fetch list' });
+            next(error);
         }
     }
-    
-    // Update vocabulary list - USC11: Edit vocabulary list
-    async updateList(req, res) {
+
+    // Handles GET /api/vocabulary/lists/mine
+    // Fetches all lists created by the currently logged-in user.
+    async getMyLists(req, res, next) {
+        try {
+            const { page = 1, limit = 20 } = req.query;
+            const result = await VocabularyList.findByCreator(req.user.id, { page, limit });
+            res.json({ success: true, ...result });
+        } catch (error) {
+            next(error);
+        }
+    }
+
+    // Handles PUT /api/vocabulary/lists/:id
+    // Updates a list's core properties (title, description, etc.).
+    async updateList(req, res, next) {
         try {
             const { id } = req.params;
-            const userId = req.user.id;
-            const updates = req.body;
-            
-            // Check ownership
-            const { data: list } = await supabase
-                .from('vocabulary_lists')
-                .select('owner_id')
-                .eq('id', id)
-                .single();
-                
-            if (!list || list.owner_id !== userId) {
-                return res.status(403).json({ error: 'Access denied' });
+
+            // --- IMPORTANT: Security Check for Ownership ---
+            const existingList = await VocabularyList.findById(id);
+            if (!existingList) {
+                return res.status(404).json({ success: false, error: 'List not found' });
             }
-            
-            // Update list
-            const { error } = await supabase
-                .from('vocabulary_lists')
-                .update({
-                    name: updates.name,
-                    description: updates.description,
-                    privacy: updates.privacy,
-                    tags: updates.tags,
-                    updated_at: new Date()
-                })
-                .eq('id', id);
-                
-            if (error) throw error;
-            
-            res.json({ message: 'List updated successfully' });
-            
+            if (existingList.creator_id !== req.user.id) {
+                return res.status(403).json({ success: false, error: 'You do not have permission to edit this list' });
+            }
+
+            const updatedList = await VocabularyList.update(id, req.body);
+            res.json({ success: true, data: updatedList, message: 'List updated successfully.' });
         } catch (error) {
-            console.error('Update list error:', error);
-            res.status(500).json({ error: 'Failed to update list' });
+            next(error);
         }
     }
-    
-    // Delete vocabulary list
-    async deleteList(req, res) {
+
+    // Handles DELETE /api/vocabulary/lists/:id
+    // Deletes a vocabulary list.
+    async deleteList(req, res, next) {
         try {
             const { id } = req.params;
-            const userId = req.user.id;
-            
-            // Check ownership
-            const { data: list } = await supabase
-                .from('vocabulary_lists')
-                .select('owner_id')
-                .eq('id', id)
-                .single();
-                
-            if (!list || list.owner_id !== userId) {
-                return res.status(403).json({ error: 'Access denied' });
+
+            // --- IMPORTANT: Security Check for Ownership ---
+            const existingList = await VocabularyList.findById(id);
+            if (!existingList) {
+                return res.status(404).json({ success: false, error: 'List not found' });
             }
-            
-            // Delete list (cascade delete words)
-            const { error } = await supabase
-                .from('vocabulary_lists')
-                .delete()
-                .eq('id', id);
-                
-            if (error) throw error;
-            
-            res.json({ message: 'List deleted successfully' });
-            
+            if (existingList.creator_id !== req.user.id) {
+                return res.status(403).json({ success: false, error: 'You do not have permission to delete this list' });
+            }
+
+            await VocabularyList.delete(id);
+            res.status(200).json({ success: true, message: 'List deleted successfully.' });
         } catch (error) {
-            console.error('Delete list error:', error);
-            res.status(500).json({ error: 'Failed to delete list' });
+            next(error);
+        }
+    }
+
+    // Handles POST /api/vocabulary/lists/:id/tags
+    // Updates the tags for a specific list.
+    async updateTagsForList(req, res, next) {
+        try {
+            const { id } = req.params;
+            const { tags } = req.body; // Expects an array of tag names, e.g., ["learning", "new"]
+
+            if (!Array.isArray(tags)) {
+                return res.status(400).json({ success: false, error: 'Tags must be an array of strings.' });
+            }
+
+            // --- IMPORTANT: Security Check for Ownership ---
+            const existingList = await VocabularyList.findById(id);
+            if (!existingList) {
+                return res.status(404).json({ success: false, error: 'List not found' });
+            }
+            if (existingList.creator_id !== req.user.id) {
+                return res.status(403).json({ success: false, error: 'You do not have permission to edit this list' });
+            }
+
+            await VocabularyList.addTagsToList(id, tags);
+            res.json({ success: true, message: 'Tags updated successfully.' });
+        } catch (error) {
+            next(error);
         }
     }
     
-    // Add word to list
-    async addWord(req, res) {
+    // --- Word Management ---
+
+    // Handles POST /api/vocabulary/lists/:listId/words
+    // Adds a word to a specific list.
+    async addWordToList(req, res, next) {
         try {
             const { listId } = req.params;
-            const userId = req.user.id;
-            const wordData = req.body;
-            
-            // Check ownership
-            const { data: list } = await supabase
-                .from('vocabulary_lists')
-                .select('owner_id')
-                .eq('id', listId)
-                .single();
-                
-            if (!list || list.owner_id !== userId) {
-                return res.status(403).json({ error: 'Access denied' });
+
+            // --- IMPORTANT: Security Check for Ownership ---
+            const existingList = await VocabularyList.findById(listId);
+            if (!existingList) {
+                return res.status(404).json({ success: false, error: 'List not found' });
             }
-            
-            // Generate AI example if needed
-            if (!wordData.example_sentence && wordData.generate_example) {
-                wordData.example_sentence = await aiService.generateExample(wordData.word);
+            if (existingList.creator_id !== req.user.id) {
+                return res.status(403).json({ success: false, error: 'You do not have permission to add words to this list' });
             }
-            
-            // Add word
-            const { data: word, error } = await supabase
-                .from('vocabulary_items')
-                .insert({
-                    list_id: listId,
-                    word: wordData.word,
-                    meaning: wordData.meaning,
-                    pronunciation: wordData.pronunciation,
-                    example_sentence: wordData.example_sentence,
-                    image_url: wordData.image_url
-                })
-                .select()
-                .single();
-                
-            if (error) throw error;
-            
-            res.status(201).json({ word });
-            
+
+            const wordData = { ...req.body, list_id: listId };
+            const newWord = await Word.create(wordData);
+            res.status(201).json({ success: true, data: newWord });
         } catch (error) {
-            console.error('Add word error:', error);
-            res.status(500).json({ error: 'Failed to add word' });
+            next(error);
+        }
+    }
+
+    // Handles DELETE /api/vocabulary/words/:wordId
+    // Deletes a specific word.
+    async deleteWord(req, res, next) {
+        try {
+            const { wordId } = req.params;
+
+            // --- IMPORTANT: Nested Security Check ---
+            // We must ensure the user owns the LIST that the word belongs to.
+            const word = await Word.findById(wordId);
+            if (!word) {
+                return res.status(404).json({ success: false, error: 'Word not found' });
+            }
+
+            const list = await VocabularyList.findById(word.list_id);
+            if (!list || list.creator_id !== req.user.id) {
+                return res.status(403).json({ success: false, error: 'You do not have permission to delete this word' });
+            }
+
+            await Word.delete(wordId);
+            res.status(200).json({ success: true, message: 'Word deleted successfully.' });
+        } catch (error) {
+            next(error);
         }
     }
 }
