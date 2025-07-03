@@ -2,13 +2,14 @@ const passport = require('passport');
 const GoogleStrategy = require('passport-google-oauth20').Strategy;
 const JwtStrategy = require('passport-jwt').Strategy;
 const ExtractJwt = require('passport-jwt').ExtractJwt;
-const User = require('../models/User');
-const { extendUserModel } = require('../models/UserExtensions');
-extendUserModel();
+
+// Supabase client and our new Profile model are now the sources of truth
+const supabase = require('./database'); 
+const Profile = require('../models/Profile'); 
 
 /**
  * JWT Strategy Configuration
- * Verify JWT tokens from Authorization header
+ * Verifies JWTs that our Express server has issued.
  */
 const configureJwtStrategy = () => {
   const options = {
@@ -19,33 +20,26 @@ const configureJwtStrategy = () => {
 
   passport.use('jwt', new JwtStrategy(options, async (req, payload, done) => {
     try {
-      // Validate JWT payload structure
+      // Validate the payload from our own token
       if (!payload.userId || !payload.email) {
         return done(null, false, { message: 'Invalid token payload' });
       }
 
-      // Get user from database using Model
-      const user = await User.findById(payload.userId);
+      // Fetch the user's profile from our 'profiles' table
+      const profile = await Profile.findById(payload.userId);
       
-      if (!user) {
+      if (!profile) {
         return done(null, false, { message: 'User not found' });
       }
 
-      // Check account status
-      if (user.status === 'suspended' || user.status === 'banned') {
-        return done(null, false, { message: `Account ${user.status}` });
+      // Check account status from the 'profiles' table
+      if (profile.account_status === 'suspended') {
+        return done(null, false, { message: `Account is suspended` });
       }
 
-      if (user.status !== 'active') {
-        return done(null, false, { message: 'Account not active' });
-      }
-
-      // Update last active timestamp
-      await User.update(user.id, { last_active: new Date() });
-
-      // Attach user to request
-      req.user = user;
-      return done(null, user);
+      // Attach full profile to request object
+      req.user = profile;
+      return done(null, profile);
     } catch (error) {
       console.error('JWT Strategy Error:', error);
       return done(error, false);
@@ -55,16 +49,14 @@ const configureJwtStrategy = () => {
 
 /**
  * Google OAuth2 Strategy Configuration
+ * Handles the OAuth flow, finds or creates a user in Supabase Auth,
+ * and then finds or creates their corresponding public profile.
  */
 const configureGoogleStrategy = () => {
-  // Skip Google OAuth in test environment
-  if (process.env.NODE_ENV === 'test') {
-    return;
-  }
+  if (process.env.NODE_ENV === 'test') return;
 
-  // Check required environment variables
   if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
-    console.warn('Google OAuth credentials not configured');
+    console.warn('Google OAuth credentials not configured. Skipping Google Strategy.');
     return;
   }
 
@@ -78,95 +70,76 @@ const configureGoogleStrategy = () => {
 
   passport.use('google', new GoogleStrategy(options, async (req, accessToken, refreshToken, profile, done) => {
     try {
-      // Validate Google profile data
       if (!profile.emails || !profile.emails[0]) {
         return done(null, false, { message: 'No email found in Google profile' });
       }
 
       const email = profile.emails[0].value;
-      const googleId = profile.id;
-
-      // Find existing user by email first, then by Google ID
-      let user = await User.findByEmail(email);
-      
-      // If not found by email, try finding by Google ID if method exists
-      if (!user && User.findByGoogleId) {
-        user = await User.findByGoogleId(googleId);
-      }
-
-      if (user) {
-        // Update Google ID if not set
-        if (!user.google_id && user.email === email) {
-          await User.update(user.id, {
-            google_id: googleId,
-            avatar_url: user.avatar_url || profile.photos[0]?.value
-          });
-        }
-
-        // Check account status
-        if (user.status === 'suspended' || user.status === 'banned') {
-          return done(null, false, { message: `Account ${user.status}` });
-        }
-
-        // Update login timestamps
-        await User.updateLastLogin(user.id);
-        
-        // Log authentication event (if auth_logs table exists)
-        try {
-          const supabase = require('./database');
-          await supabase
-            .from('auth_logs')
-            .insert({
-              user_id: user.id,
-              event_type: 'login',
-              provider: 'google',
-              ip_address: req.ip,
-              user_agent: req.headers['user-agent'],
-              created_at: new Date()
-            });
-        } catch (logError) {
-          console.error('Failed to log auth event:', logError.message);
-        }
-
-        return done(null, user);
-      }
-
-      // Create new user
-      const newUserData = {
+      const googleProfileData = {
         email: email,
-        full_name: profile.displayName || `${profile.name?.givenName || ''} ${profile.name?.familyName || ''}`.trim() || 'User',
-        avatar_url: profile.photos[0]?.value || null,
-        google_id: googleId,
-        role: 'learner', // Default role
-        status: 'active',
-        email_verified: true // Google emails are pre-verified
+        display_name: profile.displayName,
+        // avatar_url could be here, but Supabase handles it via identity data
       };
 
-      const newUser = await User.create(newUserData);
-
-      // Initialize default user data if method exists
-      if (User.initializeUserData) {
-        await User.initializeUserData(newUser.id);
+      // 1. Check if user exists in Supabase Auth
+      const { data: { user: existingAuthUser }, error: findError } = await supabase.auth.admin.getUserByEmail(email);
+      
+      if (findError && findError.status !== 404) {
+          throw findError; // Throw actual errors
       }
 
-      // Log signup event (if auth_logs table exists)
-      try {
-        const supabase = require('./database');
-        await supabase
-          .from('auth_logs')
-          .insert({
-            user_id: newUser.id,
-            event_type: 'signup',
-            provider: 'google',
-            ip_address: req.ip,
-            user_agent: req.headers['user-agent'],
-            created_at: new Date()
-          });
-      } catch (logError) {
-        console.error('Failed to log signup event:', logError.message);
+      let authUser = existingAuthUser;
+      let userProfile;
+
+      if (authUser) { // User exists in Supabase Auth
+        // User already exists, fetch their public profile
+        userProfile = await Profile.findById(authUser.id);
+        if (!userProfile) {
+            // This is a recovery case: auth user exists but profile is missing. Create it.
+            userProfile = await Profile.create({
+                id: authUser.id,
+                display_name: googleProfileData.display_name,
+                role: 'learner', // Default role
+                account_status: 'active'
+            });
+        }
+      } else { // User does NOT exist in Supabase Auth, create them
+        const { data: { user: newAuthUser }, error: createError } = await supabase.auth.admin.createUser({
+          email: email,
+          email_confirm: true, // Google emails are pre-verified
+          user_metadata: {
+            display_name: googleProfileData.display_name,
+            avatar_url: profile.photos?.[0]?.value || null,
+          }
+        });
+
+        if (createError) {
+          console.error('Supabase admin.createUser error:', createError);
+          return done(createError, false);
+        }
+        
+        authUser = newAuthUser;
+
+        // Now, create their corresponding public profile
+        userProfile = await Profile.create({
+          id: authUser.id,
+          display_name: googleProfileData.display_name,
+          role: 'learner', // Default role on first sign-up
+          account_status: 'active'
+        });
       }
 
-      return done(null, newUser);
+      // At this point, we have a valid authUser and userProfile
+      // Check for suspension
+      if (userProfile.account_status === 'suspended') {
+        return done(null, false, { message: 'Account is suspended' });
+      }
+      
+      // Update last seen timestamp
+      await Profile.update(userProfile.id, { last_seen_at: new Date() });
+
+      return done(null, userProfile);
+
     } catch (error) {
       console.error('Google Strategy Error:', error);
       return done(error, false);
@@ -175,36 +148,21 @@ const configureGoogleStrategy = () => {
 };
 
 /**
- * Serialize user for session
- * Only store user ID in session to minimize session size
+ * Serialize user for session management (used in OAuth flow).
+ * Stores only the user's ID in the session to keep it lightweight.
  */
 passport.serializeUser((user, done) => {
   done(null, user.id);
 });
 
 /**
- * Deserialize user from session
- * Fetch full user data from database
+ * Deserialize user from session.
+ * Fetches the full user profile from the database using the ID from the session.
  */
 passport.deserializeUser(async (id, done) => {
   try {
-    const user = await User.findById(id);
-    
-    if (!user) {
-      return done(null, false);
-    }
-
-    // Only return essential user data
-    const sessionUser = {
-      id: user.id,
-      email: user.email,
-      full_name: user.full_name,
-      avatar_url: user.avatar_url,
-      role: user.role,
-      status: user.status
-    };
-
-    done(null, sessionUser);
+    const profile = await Profile.findById(id);
+    done(null, profile); // Passport attaches this to req.user
   } catch (error) {
     console.error('Deserialize user error:', error);
     done(error, null);
@@ -212,14 +170,14 @@ passport.deserializeUser(async (id, done) => {
 });
 
 /**
- * Initialize all Passport strategies
+ * Initialize all Passport strategies.
  */
 const initializePassport = () => {
   configureJwtStrategy();
   configureGoogleStrategy();
 };
 
-// Initialize strategies when module loads
+// Initialize strategies when this module is loaded
 initializePassport();
 
 module.exports = passport;
